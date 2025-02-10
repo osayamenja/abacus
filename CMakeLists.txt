@@ -22,7 +22,9 @@ check_compiler_flag(CUDA -t4 NVCC_THREADS)
 
 find_package(CUDAToolkit REQUIRED)
 add_executable(abacus main.cu
-        gemm.cuh)
+        gemm.cuh
+        hGemm.cuh
+        util.cuh)
 
 set_target_properties(abacus PROPERTIES
         POSITION_INDEPENDENT_CODE ON
