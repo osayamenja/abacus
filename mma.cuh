@@ -1,12 +1,12 @@
 //
-// Created by ubuntu on 2/9/25.
+// Created by ubuntu on 2/10/25.
 //
 
-#ifndef HGEMM_CUH
-#define HGEMM_CUH
-
+#ifndef MMA_CUH
+#define MMA_CUH
+#include <cuda/std/type_traits>
+#include <cublasdx.hpp>
 #include <cute/tensor.hpp>
-#include <cute/layout.hpp>
 
 #include "gemm.cuh"
 #include "util.cuh"
@@ -16,16 +16,19 @@ namespace abacus {
         local,
         network
     };
-
     #define MULTIPLE_TIMING 0
     template<class BlockGEMM, unsigned int sharedSize = 16 * 1024, ResultType r = ResultType::local,
-    typename ProblemShape, typename StrideAB>
-    requires (sharedSize % THREADS == 0 && rank(ProblemShape{}) == 4)
-    __global__ __maxnreg__(128) __cluster_dims__(2, 1, 1)
-    void deviceCollectiveMMA(ProblemShape pS, StrideAB sAB,
-        const typename BlockGEMM::MatrixAType* __restrict__ pA,
-        const typename BlockGEMM::MatrixBType* __restrict__ pB, typename BlockGEMM::MatrixDType* __restrict__ pC,
-        const typename BlockGEMM::MatrixDType* __restrict__ pD, const bool skip = true) {
+    typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD>
+    requires (cute::is_tensor_v<MatrixA>
+        && cute::is_tensor_v<MatrixB>
+        && cute::is_tensor_v<MatrixC>
+        && cute::is_tensor_v<MatrixD>
+        && sharedSize % THREADS == 0)
+    __global__ __maxnreg__(128) void deviceCollectiveMMA(
+        const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD, const bool skip = true) {
+        using ElementD = typename decltype(mD)::value_type;
+        static_assert(sharedSize % sizeof(ElementD) == 0);
+        __shared__ __align__(16) ElementD scratch[sharedSize / sizeof(ElementD)];
 #if MULTIPLE_TIMING
         float clocked = 0.0f;
         constexpr auto rounds = 8;
@@ -33,56 +36,20 @@ namespace abacus {
             uint64_t start = 0, end = 0;
             asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
 #endif
-            auto [M, N, K, L] = pS;
-            using CollectiveMMAType = typename BlockGEMM::CollectiveMainloop;
-            auto mA = cute::make_tensor(CAST_TO(typename CollectiveMMAType::InternalElementA, pA),
-                cute::make_layout(cute::make_shape(M, K, L), sAB));
-            auto mB = cute::make_tensor(CAST_TO(typename CollectiveMMAType::InternalElementA, pB),
-                cute::make_layout(cute::make_shape(N, K, L), sAB));
-
-            typename CollectiveMMAType::Params::TMA_A tma_load_a = cute::make_tma_copy(
-                typename CollectiveMMAType::GmemTiledCopyA{},
-                mA,
-                typename CollectiveMMAType::SmemLayoutA{}(cute::_,cute::_,cute::Int<0>{}),
-                cute::make_shape(cute::shape<0>(typename CollectiveMMAType::TileShape{}),
-                    cute::shape<2>(typename CollectiveMMAType::TileShape{})),
-                    cute::size<1>(typename CollectiveMMAType::ClusterShape{}));
-
-            typename CollectiveMMAType::Params::TMA_A tma_load_b = cute::make_tma_copy(
-                typename CollectiveMMAType::GmemTiledCopyB{},
-                mB,
-                typename CollectiveMMAType::SmemLayoutB{}(cute::_,cute::_,cute::Int<0>{}),
-                cute::make_shape(cute::shape<1>(typename CollectiveMMAType::TileShape{}),
-                    cute::shape<2>(typename CollectiveMMAType::TileShape{})),
-                    cute::size<0>(typename CollectiveMMAType::ClusterShape{}));
-
-            auto cP = typename CollectiveMMAType::Params{
-                tma_load_a, tma_load_b
-            };
-
-            auto mA_mkl = tma_load_a.get_tma_tensor(make_shape(M,K,L));
-            auto mB_nkl = tma_load_b.get_tma_tensor(make_shape(N,K,L));
-
-            const auto mC = make_tensor(cute::make_gmem_ptr(pC),
-                make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
-            // bias vector (1, N) broadcast to (M, N)
-            const auto mD = make_tensor(cute::make_gmem_ptr(pD),
-                make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
-
-            using ElementD = typename BlockGEMM::MatrixDType;
-            static_assert(sharedSize % sizeof(ElementD) == 0);
-            __shared__ __align__(16) ElementD scratch[sharedSize / sizeof(ElementD)];
-
+            static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
             using ElementC = typename BlockGEMM::MatrixCType;
             constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
             constexpr auto bN = cute::get<0>(typename BlockGEMM::BlockTiler{});
+
             constexpr typename BlockGEMM::MMA tiledMMA{};
             auto accum = cute::partition_fragment_C(tiledMMA, typename BlockGEMM::TilerOut{});
             static_assert(cuda::std::is_same_v<ElementC, typename decltype(accum)::value_type>);
-            // Get the appropriate tiles for this thread block
+            // Get the appropriate blocks for this thread block
+            // use problem shape instead, p_MNK = (cute::ceil_div(M, bM), cute::ceil_div(N, bN), K)
+            //auto M = cute::get<0>(mC.shape());
+            //auto N = cute::get<1>(mC.shape());
             const auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(cute::ceil_div(cute::get<0>(mC.shape()), bM),
                 cute::ceil_div(cute::get<1>(mC.shape()), bN)));
-
             const auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
             const auto gA = local_tile(mA, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
             const auto gB = local_tile(mB, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
@@ -90,20 +57,18 @@ namespace abacus {
             const auto gD = local_tile(mD, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
             auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
             int k_tile_count = size<2>(gA);
+
             cute::clear(accum);
-            typename BlockGEMM::CollectiveMainloop mainLoop{};
-            constexpr auto cMp = typename BlockGEMM::CollectiveMainloop::Params{};
-            mainLoop(
+            typename BlockGEMM::CollectiveMainloop collective_mma{};
+            collective_mma(
+                accum,
                 gA,
-                cMp.tma_load_a,
                 gB,
-                cMp.tma_load_b,
                 accum,
                 k_tile_iter, k_tile_count,
+                cute::Underscore{},
                 threadIdx.x,
-                cute::block_rank_in_cluster(),
-                CAST_TO(char, scratch),
-                cMp);
+                CAST_TO(char, scratch));
 
             // Epilogue
             //const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -172,15 +137,15 @@ namespace abacus {
             }
             __syncthreads();
 #if MULTIPLE_TIMING
-            asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-            clocked += static_cast<float>(end - start) / static_cast<float>(rounds);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        clocked += static_cast<float>(end - start) / static_cast<float>(rounds);
         }
         if (!threadIdx.x && !skip) {
             printf("Duration was %fus\n", clocked / 1000.0f);
         }
 #endif
 
-#if 0
+#if 1
         if (!threadIdx.x && !skip) {
             cute::print_tensor(mD);
             cute::print_tensor(mA);
@@ -254,4 +219,6 @@ namespace abacus {
         free(data);
     }
 }
-#endif //HGEMM_CUH
+
+
+#endif //MMA_CUH

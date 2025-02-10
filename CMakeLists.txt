@@ -24,7 +24,8 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(abacus main.cu
         gemm.cuh
         hGemm.cuh
-        util.cuh)
+        util.cuh
+        mma.cuh)
 
 set_target_properties(abacus PROPERTIES
         POSITION_INDEPENDENT_CODE ON
